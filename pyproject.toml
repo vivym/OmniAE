@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omni-ae"
+dynamic = ["version"]
+description = "Sota Video Autoencoder"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "./LICENSE" }
+keywords = ["Video", "VAE", "Autoencoder"]
+authors = [
+  { name = "Ming Yang", email = "ymviv@qq.com" },
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: Implementation :: PyPy",
+]
+dependencies = [
+  "torch>=2.1.0",
+  "einops>=0.7.0",
+]
+
+[project.urls]
+Documentation = "https://github.com/vivym/OmniAE#readme"
+Issues = "https://github.com/vivym/OmniAE/issues"
+Source = "https://github.com/vivym/OmniAE"
