@@ -23,6 +23,10 @@ classifiers = [
 dependencies = [
   "torch>=2.1.0",
   "einops>=0.7.0",
+  "accelerate>=0.27.2",
+  "ray[train]>=2.9.3",
+  "bitsandbytes>=0.42.0",
+  "jsonargparse[argcomplete,signatures,urls]>=4.27.5",
 ]
 
 [project.urls]
