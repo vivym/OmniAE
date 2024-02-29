@@ -109,3 +109,17 @@ class RunnerConfig:
     num_gpus_per_worker: int = 1
 
     verbose_mode: int = 1   #  0 = silent, 1 = default, 2 = verbose. Defaults to 1.
+
+    reconstruction_loss_type: str = "l1"    # Choose from "l1", "l2"
+
+    reconstruction_loss_weight: float = 1.0
+
+    perceptual_loss_weight: float = 1.0
+
+    nll_loss_weight: float = 1.0
+
+    kl_loss_weight: float = 1.0
+
+    init_logvar: float = 0.0
+
+    lpips_model_name_or_path: str = "vivym/lpips"

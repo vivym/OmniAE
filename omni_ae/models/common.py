@@ -51,6 +51,65 @@ class CausalConv3d(nn.Module):
         return self.conv(x)
 
 
+class ResidualBlock2D(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        non_linearity: str = "silu",
+        norm_num_groups: int = 32,
+        norm_eps: float = 1e-6,
+        dropout: float = 0.0,
+        output_scale_factor: float = 1.0,
+    ):
+        super().__init__()
+
+        self.output_scale_factor = output_scale_factor
+
+        self.norm1 = nn.GroupNorm(
+            num_groups=norm_num_groups,
+            num_channels=in_channels,
+            eps=norm_eps,
+            affine=True,
+        )
+
+        self.nonlinearity = get_activation(non_linearity)
+
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+
+        self.norm2 = nn.GroupNorm(
+            num_groups=norm_num_groups,
+            num_channels=out_channels,
+            eps=norm_eps,
+            affine=True,
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+
+        if in_channels != out_channels:
+            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shortcut = self.shortcut(x)
+
+        x = self.norm1(x)
+        x = self.nonlinearity(x)
+
+        x = self.conv1(x)
+
+        x = self.norm2(x)
+        x = self.nonlinearity(x)
+
+        x = self.dropout(x)
+        x = self.conv2(x)
+
+        return (x + shortcut) / self.output_scale_factor
+
+
 class ResidualBlock3D(nn.Module):
     def __init__(
         self,
@@ -128,14 +187,19 @@ class SpatialDownsample2x(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # b, c, t, h, w -> (b t), c, h, w
-        batch_size = x.shape[0]
-        x = rearrange(x, "b c t h w -> (b t) c h w")
+        is_video = x.ndim == 5
+
+        if is_video:
+            # b, c, t, h, w -> (b t), c, h, w
+            batch_size = x.shape[0]
+            x = rearrange(x, "b c t h w -> (b t) c h w")
 
         x = self.conv(x)
 
-        # (b t), c, h, w -> b, c, t, h, w
-        x = rearrange(x, "(b t) c h w -> b c t h w", b=batch_size)
+        if is_video:
+            # (b t), c, h, w -> b, c, t, h, w
+            x = rearrange(x, "(b t) c h w -> b c t h w", b=batch_size)
+
         return x
 
 
@@ -158,16 +222,21 @@ class SpatialUpsample2x(nn.Module):
         nn.init.zeros_(self.conv.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # b, c, t, h, w -> (b t), c, h, w
-        batch_size = x.shape[0]
-        x = rearrange(x, "b c t h w -> (b t) c h w")
+        is_video = x.ndim == 5
+
+        if is_video:
+            # b, c, t, h, w -> (b t), c, h, w
+            batch_size = x.shape[0]
+            x = rearrange(x, "b c t h w -> (b t) c h w")
 
         x = self.conv(x)
         x = F.silu(x)
         x = rearrange(x, "b (c p1 p2) h w -> b c (h p1) (w p2)", p1=2, p2=2)
 
-        # (b t), c, h, w -> b, c, t, h, w
-        x = rearrange(x, "(b t) c h w -> b c t h w", b=batch_size)
+        if is_video:
+            # (b t), c, h, w -> b, c, t, h, w
+            x = rearrange(x, "(b t) c h w -> b c t h w", b=batch_size)
+
         return x
 
 

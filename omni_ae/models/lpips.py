@@ -8,7 +8,7 @@ from torchvision.models import vgg16, VGG16_Weights
 from safetensors import safe_open
 
 
-class LPIPS:
+class LPIPSMetric:
     def __init__(self):
         super().__init__()
 
@@ -31,7 +31,7 @@ class LPIPS:
             param.requires_grad = False
 
     @classmethod
-    def from_pretrained(cls, model_name_or_path: str) -> "LPIPS":
+    def from_pretrained(cls, model_name_or_path: str) -> "LPIPSMetric":
         _model_dir = Path(model_name_or_path)
         _model_path = _model_dir / "vgg_lpips_linear.safetensors"
         if _model_dir.exists() and _model_dir.is_dir() and _model_path.exists():
@@ -55,7 +55,7 @@ class LPIPS:
         *,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> "LPIPS":
+    ) -> "LPIPSMetric":
         self.vgg16.to(device=device, dtype=dtype)
         self.projs.to(device, dtype=dtype)
         self.mean = self.mean.to(device, dtype=dtype)

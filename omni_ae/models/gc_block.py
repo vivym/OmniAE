@@ -45,6 +45,10 @@ class GlobalContextBlock(nn.Module):
             nn.init.constant_(self.conv_add[-1].bias, init_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        is_image = x.ndim == 4
+        if is_image:
+            x = rearrange(x, "b c h w -> b c 1 h w")
+
         # x: (B, C, T, H, W)
         orig_x = x
         batch_size = x.shape[0]
@@ -68,5 +72,8 @@ class GlobalContextBlock(nn.Module):
             add_term = self.conv_add(x)
             add_term = rearrange(add_term, "(b t) c h w -> b c t h w", b=batch_size)
             x = orig_x + add_term
+
+        if is_image:
+            x = rearrange(x, "b c 1 h w -> b c h w")
 
         return x

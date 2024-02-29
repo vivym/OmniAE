@@ -399,6 +399,10 @@ class SpatialAttention(Attention):
         attention_mask: torch.FloatTensor | None = None,
         **cross_attention_kwargs,
     ) -> torch.Tensor:
+        is_image = hidden_states.ndim == 4
+        if is_image:
+            hidden_states = rearrange(hidden_states, "b c h w -> b c 1 h w")
+
         bsz, h = hidden_states.shape[0], hidden_states.shape[3]
         hidden_states = rearrange(hidden_states, "b c t h w -> (b t) (h w) c")
         if encoder_hidden_states is not None:
@@ -415,6 +419,9 @@ class SpatialAttention(Attention):
         )
 
         hidden_states = rearrange(hidden_states, "(b t) (h w) c -> b c t h w", b=bsz, h=h)
+
+        if is_image:
+            hidden_states = rearrange(hidden_states, "b c 1 h w -> b c h w")
 
         return hidden_states
 
