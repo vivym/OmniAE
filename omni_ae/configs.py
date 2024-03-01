@@ -123,3 +123,7 @@ class RunnerConfig:
     init_logvar: float = 0.0
 
     lpips_model_name_or_path: str = "vivym/lpips"
+
+    discriminator_loss_weight: float = 0.5
+
+    discriminator_start_steps: int = 1000

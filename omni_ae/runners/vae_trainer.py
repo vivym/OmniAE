@@ -54,11 +54,16 @@ class VAETrainer(Runner):
         train_dataloader = self.setup_dataloader()
 
         vae, ema_vae, lpips_metric, logvar, discriminator = self.setup_models(accelerator)
+        params_to_optimize = list(vae.parameters()) + [logvar] + list(discriminator.parameters())
 
         optimizer, lr_scheduler = self.setup_optimizer(vae.parameters())
 
-        train_dataloader, vae, logvar, discriminator, optimizer, lr_scheduler = accelerator.prepare(
-            train_dataloader, vae, logvar, discriminator, optimizer, lr_scheduler
+        disc_optimizer, disc_lr_scheduler = self.setup_optimizer(discriminator.parameters())
+
+        (
+            train_dataloader, vae, logvar, discriminator, optimizer, lr_scheduler, disc_optimizer, disc_lr_scheduler
+        ) = accelerator.prepare(
+            train_dataloader, vae, logvar, discriminator, optimizer, lr_scheduler, disc_optimizer, disc_lr_scheduler
         )
         train_dataloader: DataLoader
         vae: AutoencoderKL
@@ -66,6 +71,8 @@ class VAETrainer(Runner):
         discriminator: Discriminator
         optimizer: torch.optim.Optimizer
         lr_scheduler: torch.optim.lr_scheduler.LRScheduler
+        disc_optimizer: torch.optim.Optimizer
+        disc_lr_scheduler: torch.optim.lr_scheduler.LRScheduler
 
         total_batch_size = (
             self.runner_config.train_batch_size * accelerator.num_processes * self.runner_config.gradient_accumulation_steps
@@ -78,6 +85,7 @@ class VAETrainer(Runner):
         logger.info(f"  Total optimization steps = {self.runner_config.max_steps}")
         global_step = 0
         initial_global_step = 0
+        gan_stage = "none" if self.runner_config.discriminator_start_steps > global_step else "generator"
 
         progress_bar = tqdm(
             range(0, self.runner_config.max_steps),
@@ -93,28 +101,30 @@ class VAETrainer(Runner):
         while not done:
             vae.train()
 
-            train_loss = 0.0
+            loss_dict: dict[str, torch.Tensor] = {}
 
-            for step, batch in enumerate(train_dataloader):
-                with accelerator.accumulate(vae):
-                    loss, loss_dict = self.training_step(
+            for batch in train_dataloader:
+                with accelerator.accumulate(vae, logvar, discriminator):
+                    loss, loss_dict_i = self.training_step(
                         batch,
                         vae=vae,
                         lpips_metric=lpips_metric,
                         logvar=logvar,
                         discriminator=discriminator,
+                        gan_stage=gan_stage,
                     )
 
                     # Gather the losses across all processes for logging (if we use distributed training).
-                    losses: torch.Tensor = accelerator.gather(
-                        loss.repeat(self.runner_config.train_batch_size)
-                    )
-                    train_loss += losses.mean()
+                    for k, v in loss_dict_i.items():
+                        if k not in loss_dict:
+                            loss_dict[k] = 0.0
+
+                        losses: torch.Tensor = accelerator.gather(v)
+                        loss_dict[k] += losses.mean()
 
                     # Backpropagate
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
-                        params_to_optimize = {} # TODO: fixme
                         accelerator.clip_grad_norm_(
                             params_to_optimize, self.runner_config.gradient_clipping
                         )
@@ -122,6 +132,10 @@ class VAETrainer(Runner):
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad()
+
+                    disc_optimizer.step()
+                    disc_lr_scheduler.step()
+                    disc_optimizer.zero_grad()
 
                 logs = {"lr": lr_scheduler.get_last_lr()[0]}
                 progress_bar.set_postfix(**logs)
@@ -133,9 +147,19 @@ class VAETrainer(Runner):
 
                     progress_bar.update(1)
                     global_step += 1
-                    train_loss = train_loss / self.runner_config.gradient_accumulation_steps
-                    accelerator.log({"train_loss": train_loss}, step=global_step)
-                    train_loss = 0.0
+
+                    for k, v in loss_dict.items():
+                        loss_dict[k] = v.cpu() / self.runner_config.gradient_accumulation_steps
+                    accelerator.log(loss_dict, step=global_step)
+                    loss_dict: dict[str, torch.Tensor] = {}
+
+                    if gan_stage == "generator":
+                        gan_stage = "discriminator"
+                    elif gan_stage == "discriminator":
+                        gan_stage = "generator"
+
+                    if gan_stage == "none" and global_step >= self.runner_config.discriminator_start_steps:
+                        gan_stage = "generator"
 
                 if global_step >= self.runner_config.max_steps:
                     done = True
@@ -150,6 +174,7 @@ class VAETrainer(Runner):
         lpips_metric: LPIPSMetric,
         logvar: nn.Parameter,
         discriminator: Discriminator,
+        gan_stage: str,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         samples = batch["pixel_values"]
 
@@ -178,12 +203,42 @@ class VAETrainer(Runner):
         loss = nll_loss_weight * loss_nll + kl_loss_weight * loss_kl
 
         loss_dict = {
-            "loss": loss.detach(),
             "loss_rec": loss_rec.detach(),
             "loss_perceptual": loss_perceptual.detach(),
             "loss_nll": loss_nll.detach(),
             "loss_kl": loss_kl.detach(),
         }
+
+        if gan_stage == "generator":
+            # Update the Generator
+            logits_fake = discriminator(rec_samples)
+            loss_g = -torch.mean(logits_fake)
+
+            last_layer_weight = vae.decoder.conv_out.conv.weight
+            disc_weight = compute_adaptive_disc_weight(
+                loss_nll, loss_g, last_layer_weight
+            ) * self.runner_config.discriminator_loss_weight
+
+            loss += disc_weight * loss_g
+
+            loss_dict["loss_g"] = loss_g.detach()
+            loss_dict["disc_weight"] = disc_weight
+        elif gan_stage == "discriminator":
+            # Update the Discriminator
+            logits_real = discriminator(samples)
+            logits_fake = discriminator(rec_samples.detach())
+
+            loss_real = torch.mean(F.relu(1. - logits_real))
+            loss_fake = torch.mean(F.relu(1. + logits_fake))
+            loss_d = (loss_real + loss_fake) * 0.5
+
+            loss += loss_d # TODO: add weight to loss_d
+
+            loss_dict["loss_real"] = loss_real.detach()
+            loss_dict["loss_fake"] = loss_fake.detach()
+            loss_dict["loss_d"] = loss_d.detach()
+
+        loss_dict["loss"] = loss.detach()
 
         return loss, loss_dict
 
@@ -228,3 +283,16 @@ class VAETrainer(Runner):
         discriminator = Discriminator()
 
         return vae, ema_vae, lpips_metric, logvar, discriminator
+
+
+def compute_adaptive_disc_weight(
+    loss_nll: torch.Tensor, loss_g: torch.Tensor, last_layer_weight: nn.Parameter
+) -> torch.Tensor:
+    nll_grads = torch.autograd.grad(loss_nll, last_layer_weight, retain_graph=True)[0]
+    g_grads = torch.autograd.grad(loss_g, last_layer_weight, retain_graph=True)[0]
+
+    with torch.no_grad():
+        disc_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
+        disc_weight = torch.clamp(disc_weight, min=0.0, max=1e4)
+
+    return disc_weight
