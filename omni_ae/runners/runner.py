@@ -2,9 +2,7 @@ import abc
 
 import torch
 from accelerate import Accelerator, DeepSpeedPlugin
-from accelerate.state import AcceleratorState
 from accelerate.utils import ProjectConfiguration, set_seed
-from torch.utils.data import DataLoader
 
 from omni_ae.configs import DataConfig, ModelConfig, OptimizerConfig, RunnerConfig
 from omni_ae.utils import logging
@@ -57,9 +55,6 @@ class Runner(abc.ABC):
             set_seed(self.runner_config.seed)
 
         return accelerator
-
-    def setup_dataloader(self) -> DataLoader:
-        ...
 
     def setup_optimizer(
         self,

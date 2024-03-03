@@ -1,71 +1,13 @@
+import itertools
 from dataclasses import dataclass
-from typing import Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
 
+from omni_ae.utils.distributions import DiagonalGaussianDistribution
 from .decoder import Decoder
 from .encoder import Encoder
-
-
-class DiagonalGaussianDistribution:
-    def __init__(
-        self,
-        mean: torch.Tensor,
-        logvar: torch.Tensor,
-        deterministic: bool = False,
-    ):
-        self.mean = mean
-        self.logvar = torch.clamp(logvar, -30.0, 20.0)
-        self.deterministic = deterministic
-
-        if deterministic:
-            self.var = self.std = torch.zeros_like(self.mean)
-        else:
-            self.std = torch.exp(0.5 * self.logvar)
-            self.var = torch.exp(self.logvar)
-
-    def sample(self, generator: torch.Generator | None = None) -> torch.FloatTensor:
-        x = torch.randn(
-            self.mean.shape,
-            generator=generator,
-            device=self.mean.device,
-            dtype=self.mean.dtype,
-        )
-        return self.mean + self.std * x
-
-    def mode(self):
-        return self.mean
-
-    def kl(self, other: Optional["DiagonalGaussianDistribution"] = None) -> torch.Tensor:
-        if self.deterministic:
-            return torch.Tensor([0.0])
-        else:
-            if other is None:
-                return 0.5 * torch.sum(
-                    torch.pow(self.mean, 2) + self.var - 1.0 - self.logvar,
-                    dim=[1, 2, 3],
-                )
-            else:
-                return 0.5 * torch.sum(
-                    torch.pow(self.mean - other.mean, 2) / other.var
-                    + self.var / other.var
-                    - 1.0
-                    - self.logvar
-                    + other.logvar,
-                    dim=[1, 2, 3],
-                )
-
-    def nll(self, sample: torch.Tensor, dims: tuple[int, ...] = [1, 2, 3]) -> torch.Tensor:
-        if self.deterministic:
-            return torch.Tensor([0.0])
-
-        logtwopi = np.log(2.0 * np.pi)
-        return 0.5 * torch.sum(
-            logtwopi + self.logvar + torch.pow(sample - self.mean, 2) / self.var,
-            dim=dims,
-        )
+from .vae_loss import VAELoss
 
 
 @dataclass
@@ -85,13 +27,13 @@ class AutoencoderKL(nn.Module):
     Parameters:
         in_channels (int, *optional*, defaults to 3): Number of channels in the input video.
         out_channels (int,  *optional*, defaults to 3): Number of channels in the output.
-        down_block_types (`Tuple[str]`, *optional*, defaults to `("SpatialDownBlock3D",)`):
+        down_block_types (`Tuple[str, ...]`, *optional*, defaults to `("SpatialDownBlock3D",)`):
             Tuple of downsample block types.
-        up_block_types (`Tuple[str]`, *optional*, defaults to `("SpatialUpBlock3D",)`):
+        up_block_types (`Tuple[str, ...]`, *optional*, defaults to `("SpatialUpBlock3D",)`):
             Tuple of upsample block types.
-        block_out_channels (`Tuple[int]`, *optional*, defaults to `(64,)`):
+        block_out_channels (`Tuple[int, ...]`, *optional*, defaults to `(64,)`):
             Tuple of block output channels.
-        use_gc_blocks (`Tuple[bool]`, *optional*, defaults to `None`):
+        use_gc_blocks (`Tuple[bool, ...]`, *optional*, defaults to `None`):
             Tuple of booleans indicating whether to use global context block in the corresponding down/up block.
         mid_block_type: (`str`, *optional*, defaults to `"MidBlock3D"`): Type of the middle block.
         mid_block_use_attention (`bool`, *optional*, defaults to `True`):
@@ -114,16 +56,19 @@ class AutoencoderKL(nn.Module):
             diffusion model. When decoding, the latents are scaled back to the original scale with the formula: `z = 1
             / scaling_factor * z`. For more details, refer to sections 4.3.2 and D.1 of the [High-Resolution Image
             Synthesis with Latent Diffusion Models](https://arxiv.org/abs/2112.10752) paper.
+        with_loss (`bool`, *optional*, defaults to `False`):
+            Whether to compute the loss during forward pass. If `True`, the forward pass returns a dictionary with
+            the loss and the output. If `False`, the forward pass returns the output.
     """
 
     def __init__(
         self,
         in_channels: int = 3,
         out_channels: int = 3,
-        down_block_types: tuple[str] = ("SpatialDownBlock3D",),
-        up_block_types: tuple[str] = ("SpatialUpBlock3D",),
-        block_out_channels: tuple[int] = (64,),
-        use_gc_blocks: tuple[bool] | None = None,
+        down_block_types: tuple[str, ...] = ("SpatialDownBlock3D",),
+        up_block_types: tuple[str, ...] = ("SpatialUpBlock3D",),
+        block_out_channels: tuple[int, ...] = (64,),
+        use_gc_blocks: tuple[bool, ...] | None = None,
         mid_block_type: str = "MidBlock3D",
         mid_block_use_attention: bool = True,
         mid_block_attention_type: str = "3d",
@@ -134,10 +79,12 @@ class AutoencoderKL(nn.Module):
         latent_channels: int = 8,
         norm_num_groups: int = 32,
         scaling_factor: float = 0.18215,
+        with_loss: bool = False,
     ):
         super().__init__()
 
         self.scaling_factor = scaling_factor
+        self.with_loss = with_loss
 
         self.encoder = Encoder(
             in_channels=in_channels,
@@ -180,6 +127,8 @@ class AutoencoderKL(nn.Module):
         self.quant_conv = nn.Conv3d(2 * latent_channels, 2 * latent_channels, kernel_size=1)
         self.post_quant_conv = nn.Conv3d(latent_channels, latent_channels, kernel_size=1)
 
+        self.loss = VAELoss()
+
     def encode(self, x: torch.Tensor) -> EncoderOutput:
         h = self.encoder(x)
 
@@ -196,3 +145,30 @@ class AutoencoderKL(nn.Module):
         decoded = decoded[:, :, self.temporal_padding:, ...]
 
         return DecoderOutput(sample=decoded)
+
+    def parameters_without_loss(self):
+        return itertools.chain(
+            self.encoder.parameters(),
+            self.decoder.parameters(),
+            self.quant_conv.parameters(),
+            self.post_quant_conv.parameters(),
+        )
+
+    def training_step(
+        self,
+        samples: torch.Tensor,
+        gan_stage: str,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        posterior = self.encode(samples).latent_dist
+
+        z = posterior.sample()
+
+        rec_samples = self.decode(z).sample
+
+        return self.loss(
+            samples=samples,
+            posterior=posterior,
+            rec_samples=rec_samples,
+            last_layer_weight=self.decoder.conv_out.conv.weight,
+            gan_stage=gan_stage,
+        )

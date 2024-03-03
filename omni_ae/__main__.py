@@ -36,6 +36,16 @@ def add_run_subcommand(subcommands: "_ActionSubCommands"):
     )
 
     parser.add_dataclass_arguments(
+        ModelConfig,
+        nested_key="model",
+    )
+
+    parser.add_dataclass_arguments(
+        OptimizerConfig,
+        nested_key="optimizer",
+    )
+
+    parser.add_dataclass_arguments(
         RunnerConfig,
         nested_key="runner",
     )

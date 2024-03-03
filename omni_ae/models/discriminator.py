@@ -95,7 +95,6 @@ class Discriminator(nn.Module):
         norm_num_groups: int = 32,
         act_fn: str = "silu",
         num_attention_heads: int = 1,
-        double_z: bool = True,
     ):
         super().__init__()
 

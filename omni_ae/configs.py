@@ -16,13 +16,13 @@ class ModelConfig:
 
     out_channels: int = 3
 
-    down_block_types: tuple[str] = ("SpatialDownBlock3D",)
+    down_block_types: tuple[str, ...] = ("SpatialDownBlock3D",)
 
-    up_block_types: tuple[str] = ("SpatialUpBlock3D",)
+    up_block_types: tuple[str, ...] = ("SpatialUpBlock3D",)
 
-    block_out_channels: tuple[int] = (64,)
+    block_out_channels: tuple[int, ...] = (64,)
 
-    use_gc_blocks: tuple[bool] | None = None
+    use_gc_blocks: tuple[bool, ...] | None = None
 
     mid_block_type: str = "MidBlock3D"
 

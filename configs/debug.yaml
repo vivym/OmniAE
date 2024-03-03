@@ -1,0 +1,24 @@
+data:
+  dataset_name_or_path: /home/mingyang/projs/OmniAE/data/InternVid-10M-FLT-clip.txt
+
+model:
+  down_block_types:
+    - SpatialDownBlock3D
+    - SpatialDownBlock3D
+    - TemporalDownBlock3D
+    - TemporalDownBlock3D
+  up_block_types:
+    - TemporalUpBlock3D
+    - TemporalUpBlock3D
+    - SpatialUpBlock3D
+    - SpatialUpBlock3D
+  block_out_channels:
+    - 8
+    - 16
+    - 16
+    - 32
+  layers_per_block: 1
+  norm_num_groups: 2
+
+runner:
+  runner_cls_path: omni_ae.runners.vae_trainer.VAETrainer

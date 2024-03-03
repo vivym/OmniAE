@@ -1,15 +1,14 @@
 import copy
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from accelerate import Accelerator
 from ray.train import CheckpointConfig, ScalingConfig, SyncConfig, RunConfig
 from ray.train.torch import TorchTrainer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from omni_ae.models import AutoencoderKL, Discriminator, LPIPSMetric
+from omni_ae.data.video_dataset import VideoDataset
+from omni_ae.models import AutoencoderKL
 from omni_ae.utils import logging
 from omni_ae.utils.ema import EMAModel
 from .runner import Runner
@@ -32,7 +31,7 @@ class VAETrainer(Runner):
             ),
             run_config=RunConfig(
                 name=self.runner_config.name,
-                storage_path=self.runner_config.storage_path,
+                # storage_path=self.runner_config.storage_path,
                 # TODO: failure_config
                 checkpoint_config=CheckpointConfig(),
                 sync_config=SyncConfig(
@@ -53,22 +52,20 @@ class VAETrainer(Runner):
 
         train_dataloader = self.setup_dataloader()
 
-        vae, ema_vae, lpips_metric, logvar, discriminator = self.setup_models(accelerator)
-        params_to_optimize = list(vae.parameters()) + [logvar] + list(discriminator.parameters())
+        vae, ema_vae = self.setup_models(accelerator)
+        params_to_optimize = list(vae.parameters_without_loss())
 
-        optimizer, lr_scheduler = self.setup_optimizer(vae.parameters())
+        optimizer, lr_scheduler = self.setup_optimizer(vae.parameters_without_loss())
 
-        disc_optimizer, disc_lr_scheduler = self.setup_optimizer(discriminator.parameters())
+        disc_optimizer, disc_lr_scheduler = self.setup_optimizer(vae.loss.parameters())
 
         (
-            train_dataloader, vae, logvar, discriminator, optimizer, lr_scheduler, disc_optimizer, disc_lr_scheduler
+            train_dataloader, vae, optimizer, lr_scheduler, disc_optimizer, disc_lr_scheduler
         ) = accelerator.prepare(
-            train_dataloader, vae, logvar, discriminator, optimizer, lr_scheduler, disc_optimizer, disc_lr_scheduler
+            train_dataloader, vae, optimizer, lr_scheduler, disc_optimizer, disc_lr_scheduler
         )
         train_dataloader: DataLoader
         vae: AutoencoderKL
-        logvar: nn.Parameter
-        discriminator: Discriminator
         optimizer: torch.optim.Optimizer
         lr_scheduler: torch.optim.lr_scheduler.LRScheduler
         disc_optimizer: torch.optim.Optimizer
@@ -104,13 +101,9 @@ class VAETrainer(Runner):
             loss_dict: dict[str, torch.Tensor] = {}
 
             for batch in train_dataloader:
-                with accelerator.accumulate(vae, logvar, discriminator):
-                    loss, loss_dict_i = self.training_step(
-                        batch,
-                        vae=vae,
-                        lpips_metric=lpips_metric,
-                        logvar=logvar,
-                        discriminator=discriminator,
+                with accelerator.accumulate(vae):
+                    loss, loss_dict_i = vae.training_step(
+                        samples=batch["pixel_values"],
                         gan_stage=gan_stage,
                     )
 
@@ -167,84 +160,26 @@ class VAETrainer(Runner):
 
         accelerator.end_training()
 
-    def training_step(
-        self,
-        batch: dict[str, torch.Tensor],
-        vae : AutoencoderKL,
-        lpips_metric: LPIPSMetric,
-        logvar: nn.Parameter,
-        discriminator: Discriminator,
-        gan_stage: str,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        samples = batch["pixel_values"]
+    def setup_dataloader(self) -> DataLoader:
+        video_paths = []
+        with open(self.data_config.dataset_name_or_path, "r") as f:
+            for line in f:
+                line: str = line.strip()
+                if line:
+                    video_paths.append(line.strip())
 
-        posterior = vae.encode(samples).latent_dist
+        dataset = VideoDataset(video_paths)
 
-        z = posterior.sample()
+        return DataLoader(
+            dataset,
+            batch_size=self.runner_config.train_batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True,
+            drop_last=True,
+        )
 
-        rec_samples = vae.decode(z).sample
-
-        loss_rec = F.l1_loss(samples, rec_samples)
-
-        loss_perceptual = lpips_metric(samples, rec_samples)
-
-        reconstruction_loss_weight = self.runner_config.reconstruction_loss_weight
-        perceptual_loss_weight = self.runner_config.perceptual_loss_weight
-        loss_nll = (
-            reconstruction_loss_weight * loss_rec + perceptual_loss_weight * loss_perceptual
-        ) / torch.exp(logvar) + logvar
-        loss_nll = loss_nll.sum() / loss_nll.shape[0]
-
-        loss_kl = posterior.kl()
-        loss_kl = loss_kl.sum() / loss_kl.shape[0]
-
-        nll_loss_weight = self.runner_config.nll_loss_weight
-        kl_loss_weight = self.runner_config.kl_loss_weight
-        loss = nll_loss_weight * loss_nll + kl_loss_weight * loss_kl
-
-        loss_dict = {
-            "loss_rec": loss_rec.detach(),
-            "loss_perceptual": loss_perceptual.detach(),
-            "loss_nll": loss_nll.detach(),
-            "loss_kl": loss_kl.detach(),
-        }
-
-        if gan_stage == "generator":
-            # Update the Generator
-            logits_fake = discriminator(rec_samples)
-            loss_g = -torch.mean(logits_fake)
-
-            last_layer_weight = vae.decoder.conv_out.conv.weight
-            disc_weight = compute_adaptive_disc_weight(
-                loss_nll, loss_g, last_layer_weight
-            ) * self.runner_config.discriminator_loss_weight
-
-            loss += disc_weight * loss_g
-
-            loss_dict["loss_g"] = loss_g.detach()
-            loss_dict["disc_weight"] = disc_weight
-        elif gan_stage == "discriminator":
-            # Update the Discriminator
-            logits_real = discriminator(samples)
-            logits_fake = discriminator(rec_samples.detach())
-
-            loss_real = torch.mean(F.relu(1. - logits_real))
-            loss_fake = torch.mean(F.relu(1. + logits_fake))
-            loss_d = (loss_real + loss_fake) * 0.5
-
-            loss += loss_d # TODO: add weight to loss_d
-
-            loss_dict["loss_real"] = loss_real.detach()
-            loss_dict["loss_fake"] = loss_fake.detach()
-            loss_dict["loss_d"] = loss_d.detach()
-
-        loss_dict["loss"] = loss.detach()
-
-        return loss, loss_dict
-
-    def setup_models(
-        self, accelerator: Accelerator
-    ) -> tuple[AutoencoderKL, EMAModel | None, LPIPSMetric, nn.Parameter, Discriminator]:
+    def setup_models(self, accelerator: Accelerator) -> tuple[AutoencoderKL, EMAModel | None]:
         vae = AutoencoderKL(
             in_channels=self.model_config.in_channels,
             out_channels=self.model_config.out_channels,
@@ -261,9 +196,13 @@ class VAETrainer(Runner):
             latent_channels=self.model_config.latent_channels,
             norm_num_groups=self.model_config.norm_num_groups,
             scaling_factor=self.model_config.scaling_factor,
+            with_loss=True,
         )
 
         vae.train()
+
+        # TODO: dtype? (for lpips_metric)
+        vae.loss.to(device=accelerator.device)
 
         # Create EMA for the vae.
         if self.runner_config.use_ema:
@@ -275,24 +214,4 @@ class VAETrainer(Runner):
         else:
             ema_vae = None
 
-        lpips_metric = LPIPSMetric.from_pretrained(self.runner_config.lpips_model_name_or_path)
-        lpips_metric.to(accelerator.device)
-
-        logvar = nn.Parameter(torch.full((), self.runner_config.init_logvar, dtype=torch.float32))
-
-        discriminator = Discriminator()
-
-        return vae, ema_vae, lpips_metric, logvar, discriminator
-
-
-def compute_adaptive_disc_weight(
-    loss_nll: torch.Tensor, loss_g: torch.Tensor, last_layer_weight: nn.Parameter
-) -> torch.Tensor:
-    nll_grads = torch.autograd.grad(loss_nll, last_layer_weight, retain_graph=True)[0]
-    g_grads = torch.autograd.grad(loss_g, last_layer_weight, retain_graph=True)[0]
-
-    with torch.no_grad():
-        disc_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
-        disc_weight = torch.clamp(disc_weight, min=0.0, max=1e4)
-
-    return disc_weight
+        return vae, ema_vae
