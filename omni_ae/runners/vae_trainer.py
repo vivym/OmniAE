@@ -107,6 +107,13 @@ class VAETrainer(Runner):
                         gan_stage=gan_stage,
                     )
 
+                    # Backpropagate
+                    accelerator.backward(loss)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(
+                            params_to_optimize, self.runner_config.gradient_clipping
+                        )
+
                     # Gather the losses across all processes for logging (if we use distributed training).
                     for k, v in loss_dict_i.items():
                         if k not in loss_dict:
@@ -114,13 +121,6 @@ class VAETrainer(Runner):
 
                         losses: torch.Tensor = accelerator.gather(v)
                         loss_dict[k] += losses.mean()
-
-                    # Backpropagate
-                    accelerator.backward(loss)
-                    if accelerator.sync_gradients:
-                        accelerator.clip_grad_norm_(
-                            params_to_optimize, self.runner_config.gradient_clipping
-                        )
 
                     optimizer.step()
                     lr_scheduler.step()
@@ -131,7 +131,6 @@ class VAETrainer(Runner):
                     disc_optimizer.zero_grad()
 
                 logs = {"lr": lr_scheduler.get_last_lr()[0]}
-                progress_bar.set_postfix(**logs)
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
@@ -142,7 +141,8 @@ class VAETrainer(Runner):
                     global_step += 1
 
                     for k, v in loss_dict.items():
-                        loss_dict[k] = v.cpu() / self.runner_config.gradient_accumulation_steps
+                        loss_dict[k] = v.item() / self.runner_config.gradient_accumulation_steps
+                    logs.update({"loss": loss_dict["loss"]})
                     accelerator.log(loss_dict, step=global_step)
                     loss_dict: dict[str, torch.Tensor] = {}
 
@@ -153,6 +153,8 @@ class VAETrainer(Runner):
 
                     if gan_stage == "none" and global_step >= self.runner_config.discriminator_start_steps:
                         gan_stage = "generator"
+
+                progress_bar.set_postfix(**logs)
 
                 if global_step >= self.runner_config.max_steps:
                     done = True

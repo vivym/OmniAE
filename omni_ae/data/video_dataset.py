@@ -23,4 +23,16 @@ class VideoDataset(Dataset):
 
         frames = torch.stack(frames, dim=1)
 
+        if frames.shape[1] < 17:
+            pad = torch.zeros(
+                frames.shape[0],
+                17 - frames.shape[1],
+                frames.shape[2],
+                frames.shape[3],
+            )
+            frames = torch.cat([frames, pad], dim=1)
+
+        # TODO: remove this
+        frames = frames[:, :, :64, :64]
+
         return {"pixel_values": frames}
